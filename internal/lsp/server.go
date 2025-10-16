@@ -45,7 +45,7 @@ func NewServer(opts *ServerOptions) *Server {
 	if opts.Cwd == "" {
 		panic("Cwd is required")
 	}
-	return &Server{
+	server := Server{
 		r:                     opts.In,
 		w:                     opts.Out,
 		stderr:                opts.Err,
@@ -60,6 +60,14 @@ func NewServer(opts *ServerOptions) *Server {
 		typingsLocation:       opts.TypingsLocation,
 		parseCache:            opts.ParseCache,
 	}
+
+	reporter := Reporter{
+		s: &server,
+	}
+
+	server.reporter = reporter
+
+	return &server
 }
 
 var (
@@ -157,6 +165,55 @@ type Server struct {
 	compilerOptionsForInferredProjects *core.CompilerOptions
 	// parseCache can be passed in so separate tests can share ASTs
 	parseCache *project.ParseCache
+
+	reporter Reporter
+}
+
+type Reporter struct {
+	s  *Server
+	id lsproto.ID
+}
+
+func (r *Reporter) send(req *lsproto.RequestMessage) {
+	r.s.outgoingQueue <- req.Message()
+}
+
+func (r *Reporter) Begin() {
+	if r.s == nil {
+		panic("Reporter should have a server pointer")
+	}
+
+	token := r.id.String()
+	response := lsproto.WorkDoneProgressCreateParams{
+		Token: lsproto.IntegerOrString{
+			String: &token,
+		},
+	}
+
+	id := lsproto.NewIDString(fmt.Sprintf("ts%d", r.s.clientSeq.Add(1)))
+	req := lsproto.NewRequestMessage("window/workDoneProgress/create", id, response)
+	r.send(req)
+
+	reportMsg := lsproto.ProgressParams{
+		Token: lsproto.IntegerOrString{
+			String: &token,
+		},
+		Value: lsproto.WorkDoneProgressBegin{
+			Kind:       lsproto.StringLiteralBegin{},
+			Title:      "building index",
+			Message:    ptrTo(string("resolving")),
+			Percentage: ptrTo(uint32(0)),
+		},
+	}
+
+	id2 := lsproto.NewIDString(fmt.Sprintf("ts%d", r.s.clientSeq.Add(1)))
+	req2 := lsproto.NewRequestMessage("$/progress", id2, reportMsg)
+
+	r.send(req2)
+}
+
+func (r *Reporter) Report() {
+	// TODO
 }
 
 // WatchFiles implements project.Client.
@@ -573,6 +630,10 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 
 	if s.initializeParams.Trace != nil && *s.initializeParams.Trace == "verbose" {
 		s.logger.SetVerbose(true)
+	}
+
+	if *params.Capabilities.Window.WorkDoneProgress == true {
+		s.reporter.Begin()
 	}
 
 	response := &lsproto.InitializeResult{
